@@ -1,0 +1,8 @@
+{
+  "uuid": "smooth-scroll@knap43.github.io",
+  "name": "Smooth Scroll",
+  "description": "Smooth, eased mouse-wheel scrolling in every app. Requires the smooth-scrolld service from the repository.",
+  "shell-version": ["49", "50", "51"],
+  "settings-schema": "org.gnome.shell.extensions.smooth-scroll",
+  "url": "https://github.com/knap43/smooth-scroll"
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=Smooth mouse-wheel scrolling
+Documentation=https://github.com/knap43/smooth-scroll
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/smooth-scrolld
+ExecReload=kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

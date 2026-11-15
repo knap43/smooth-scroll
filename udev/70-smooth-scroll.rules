@@ -1,0 +1,4 @@
+# Let the user at the active seat create virtual input devices and read mice,
+# so smooth-scrolld can run unprivileged. Must sort before 73-seat-late.rules.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", TAG+="uaccess"

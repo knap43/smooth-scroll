@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""smooth-scrolld: turns mouse-wheel clicks into smooth, eased scrolling.
+
+Every mouse is grabbed and mirrored by a virtual twin. All of its events pass
+through untouched, except the wheel: each click is spread over a short glide
+of high-resolution scroll steps, which GTK, Qt, Firefox and GNOME Shell render
+as smooth motion.
+
+Settings live in $XDG_CONFIG_HOME/smooth-scroll/config.json and are re-read on
+SIGHUP (`systemctl --user reload smooth-scroll`).
+"""
+
+import asyncio
+import json
+import math
+import os
+import signal
+import sys
+
+import evdev
+from evdev import ecodes as e
+
+VIRTUAL_PHYS = 'smooth-scroll/virtual'
+TICK = 1 / 240          # seconds between glide steps
+NOTCH = 120             # high-resolution units per wheel click
+RESCAN_INTERVAL = 2     # seconds between hotplug scans
+
+CONFIG_PATH = os.path.join(
+    os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'),
+    'smooth-scroll', 'config.json')
+DEFAULTS = {'speed': 1.0, 'duration': 250, 'horizontal': True}
+LIMITS = {'speed': (0.1, 10.0), 'duration': (20, 2000)}
+
+WHEEL_CODES = {e.REL_WHEEL, e.REL_WHEEL_HI_RES, e.REL_HWHEEL, e.REL_HWHEEL_HI_RES}
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+        for key, default in DEFAULTS.items():
+            if key in data:
+                cfg[key] = type(default)(data[key])
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError) as err:
+        log(f'Ignoring unreadable config {CONFIG_PATH}: {err}')
+    for key, (lo, hi) in LIMITS.items():
+        cfg[key] = min(max(cfg[key], lo), hi)
+    return cfg
+
+
+class Axis:
+    """One scroll axis: a queue of high-resolution units still to be emitted."""
+
+    def __init__(self, hires_code, lores_code):
+        self.hires_code = hires_code
+        self.lores_code = lores_code
+        self.remaining = 0   # units still to glide through
+        self.carry = 0.0     # fraction lost to rounding when scaling by speed
+        self.lores = 0       # units emitted since the last whole click
+
+    def add(self, units, speed):
+        if self.remaining and (units > 0) != (self.remaining > 0):
+            # Reversing direction cancels the glide instead of fighting it.
+            self.remaining = 0
+            self.carry = 0.0
+            self.lores = 0
+        scaled = units * speed + self.carry
+        whole = round(scaled)
+        self.carry = scaled - whole
+        self.remaining += whole
+
+    def step(self, fraction):
+        """Emit `fraction` of what remains; return (hires, lores) to write."""
+        if not self.remaining:
+            return 0, 0
+        n = round(self.remaining * fraction)
+        if n == 0:
+            n = 1 if self.remaining > 0 else -1
+        self.remaining -= n
+        # Mirror the kernel: also report a classic click per 120 units, for
+        # clients that ignore high-resolution scrolling.
+        self.lores += n
+        clicks = int(self.lores / NOTCH)
+        self.lores -= clicks * NOTCH
+        return n, clicks
+
+
+class Mouse:
+    def __init__(self, daemon, dev):
+        self.daemon = daemon
+        self.dev = dev
+        caps = dev.capabilities()
+        caps.pop(e.EV_SYN, None)
+        caps.pop(e.EV_FF, None)
+        rel = set(caps.get(e.EV_REL, []))
+        self.native_hires_v = e.REL_WHEEL_HI_RES in rel
+        self.native_hires_h = e.REL_HWHEEL_HI_RES in rel
+        caps[e.EV_REL] = sorted(rel | WHEEL_CODES)
+        self.ui = evdev.UInput(caps, name=f'{dev.name} (smooth)',
+                               bustype=dev.info.bustype, phys=VIRTUAL_PHYS)
+        self.v = Axis(e.REL_WHEEL_HI_RES, e.REL_WHEEL)
+        self.h = Axis(e.REL_HWHEEL_HI_RES, e.REL_HWHEEL)
+        self.wake = asyncio.Event()
+        dev.grab()
+        self.tasks = [asyncio.ensure_future(self.read()),
+                      asyncio.ensure_future(self.glide())]
+
+    def close(self):
+        for task in self.tasks:
+            if task is not asyncio.current_task():
+                task.cancel()
+        for action in (self.dev.ungrab, self.dev.close, self.ui.close):
+            try:
+                action()
+            except (OSError, ValueError):
+                pass  # already gone, or already closed
+
+    def wheel(self, code, value, frame):
+        """Queue a wheel event for gliding; return False to let it pass."""
+        vertical = code in (e.REL_WHEEL, e.REL_WHEEL_HI_RES)
+        hires = code in (e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES)
+        native = self.native_hires_v if vertical else self.native_hires_h
+        if not vertical and not self.daemon.cfg['horizontal']:
+            frame.append((e.EV_REL, code, value))
+            if not native:
+                # The twin advertises hi-res axes, so libinput would ignore
+                # bare classic clicks on it: add their hi-res equivalent.
+                frame.append((e.EV_REL, e.REL_HWHEEL_HI_RES, value * NOTCH))
+            return
+        if not hires and native:
+            return  # the device reports this motion again in hi-res units
+        units = value if hires else value * NOTCH
+        (self.v if vertical else self.h).add(units, self.daemon.cfg['speed'])
+        self.wake.set()
+
+    async def read(self):
+        frame = []
+        try:
+            async for ev in self.dev.async_read_loop():
+                if ev.type == e.EV_REL and ev.code in WHEEL_CODES:
+                    self.wheel(ev.code, ev.value, frame)
+                elif ev.type == e.EV_SYN:
+                    if ev.code == e.SYN_REPORT and frame:
+                        # Written whole, so a glide step never splits a frame.
+                        for event in frame:
+                            self.ui.write(*event)
+                        self.ui.syn()
+                    frame.clear()
+                else:
+                    frame.append((ev.type, ev.code, ev.value))
+        except OSError:
+            pass  # unplugged
+        finally:
+            self.daemon.forget(self)
+
+    async def glide(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            await self.wake.wait()
+            self.wake.clear()
+            last = loop.time()
+            while self.v.remaining or self.h.remaining:
+                await asyncio.sleep(TICK)
+                now = loop.time()
+                # Exponential ease-out: ~98 % of a glide lands within `duration`.
+                tau = self.daemon.cfg['duration'] / 1000 / 4
+                fraction = 1 - math.exp(-min(now - last, 0.05) / tau)
+                last = now
+                wrote = False
+                for axis in (self.v, self.h):
+                    hires, clicks = axis.step(fraction)
+                    if hires:
+                        self.ui.write(e.EV_REL, axis.hires_code, hires)
+                        wrote = True
+                    if clicks:
+                        self.ui.write(e.EV_REL, axis.lores_code, clicks)
+                if wrote:
+                    self.ui.syn()
+
+
+def is_mouse(dev):
+    if dev.phys == VIRTUAL_PHYS:
+        return False
+    caps = dev.capabilities()
+    rel = set(caps.get(e.EV_REL, []))
+    keys = set(caps.get(e.EV_KEY, []))
+    return (e.BTN_LEFT in keys and {e.REL_X, e.REL_Y} <= rel
+            and bool(rel & {e.REL_WHEEL, e.REL_WHEEL_HI_RES}))
+
+
+class Daemon:
+    def __init__(self):
+        self.cfg = load_config()
+        self.mice = {}        # path -> Mouse
+        self.skipped = set()  # paths that are not mice or are unreadable
+        self.stopping = asyncio.Event()
+
+    def reload(self):
+        self.cfg = load_config()
+        log(f'Settings: {self.cfg}')
+
+    def forget(self, mouse):
+        for path, m in list(self.mice.items()):
+            if m is mouse:
+                del self.mice[path]
+                log(f'Released {mouse.dev.name}')
+        mouse.close()
+
+    def scan(self):
+        present = set(evdev.list_devices())
+        self.skipped &= present
+        for path in present - self.skipped - self.mice.keys():
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError:
+                self.skipped.add(path)  # no permission: not a mouse we may use
+                continue
+            if not is_mouse(dev):
+                dev.close()
+                self.skipped.add(path)
+                continue
+            try:
+                self.mice[path] = Mouse(self, dev)
+                log(f'Smoothing {dev.name} ({path})')
+            except OSError as err:
+                log(f'Cannot take over {dev.name} ({path}): {err}')
+                dev.close()
+                self.skipped.add(path)
+
+    async def run(self):
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGHUP, self.reload)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self.stopping.set)
+        log(f'Settings: {self.cfg}')
+        while not self.stopping.is_set():
+            self.scan()
+            try:
+                await asyncio.wait_for(self.stopping.wait(), RESCAN_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+        for mouse in list(self.mice.values()):
+            mouse.close()
+
+
+def main():
+    try:
+        open('/dev/uinput', 'wb').close()
+    except OSError as err:
+        log(f'Cannot open /dev/uinput ({err}); run install.sh to set up access.')
+        return 1
+    asyncio.run(Daemon().run())
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

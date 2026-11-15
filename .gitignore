@@ -1,0 +1,4 @@
+build/
+*.shell-extension.zip
+gschemas.compiled
+__pycache__/

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.smooth-scroll"
+          path="/org/gnome/shell/extensions/smooth-scroll/">
+    <key name="enabled" type="b">
+      <default>true</default>
+      <summary>Smooth scrolling is on</summary>
+    </key>
+    <key name="speed" type="d">
+      <range min="0.1" max="10.0"/>
+      <default>1.0</default>
+      <summary>Distance multiplier per wheel click</summary>
+    </key>
+    <key name="duration" type="i">
+      <range min="20" max="2000"/>
+      <default>250</default>
+      <summary>Length of a glide, in milliseconds</summary>
+    </key>
+    <key name="horizontal" type="b">
+      <default>true</default>
+      <summary>Smooth horizontal wheel scrolling too</summary>
+    </key>
+  </schema>
+</schemalist>
