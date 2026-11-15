@@ -55,6 +55,19 @@ Open them with `gnome-extensions prefs smooth-scroll@knap43.github.io`.
 | Glide duration       | 250 ms  | Time for a click's glide to settle         |
 | Horizontal scrolling | on      | Also smooth tilt wheels and side wheels    |
 
+### App rules
+
+Under **App Rules** in the preferences, add any installed app with the **+**
+button. Each rule either turns smoothing off for that app or gives it its own
+Distance and Glide duration. A rule applies to the app whose window is under
+the pointer when you scroll. Apps without a rule, and the Shell's own UI, use
+the global settings.
+
+The extension tracks the window under the pointer and passes the matching
+rule to the service over a private socket,
+`$XDG_RUNTIME_DIR/smooth-scroll.sock`. App rules therefore need the extension;
+the service alone always uses the global settings.
+
 ### Without the extension
 
 The service also runs on its own. Write

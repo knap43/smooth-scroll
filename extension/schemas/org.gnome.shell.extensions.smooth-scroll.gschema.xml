@@ -20,5 +20,10 @@
       <default>true</default>
       <summary>Smooth horizontal wheel scrolling too</summary>
     </key>
+    <key name="app-rules" type="s">
+      <default>'{}'</default>
+      <summary>Per-app rules</summary>
+      <description>JSON object keyed by desktop app ID; each value holds "enabled" and, when enabled, "speed" and "duration".</description>
+    </key>
   </schema>
 </schemalist>

@@ -29,6 +29,9 @@ RESCAN_INTERVAL = 2     # seconds between hotplug scans
 CONFIG_PATH = os.path.join(
     os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'),
     'smooth-scroll', 'config.json')
+SOCKET_PATH = os.path.join(
+    os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}',
+    'smooth-scroll.sock')
 DEFAULTS = {'speed': 1.0, 'duration': 250, 'horizontal': True}
 LIMITS = {'speed': (0.1, 10.0), 'duration': (20, 2000)}
 
@@ -51,9 +54,29 @@ def load_config():
         pass
     except (OSError, ValueError, TypeError) as err:
         log(f'Ignoring unreadable config {CONFIG_PATH}: {err}')
+    return clamp(cfg)
+
+
+def clamp(cfg):
     for key, (lo, hi) in LIMITS.items():
-        cfg[key] = min(max(cfg[key], lo), hi)
+        if key in cfg:
+            cfg[key] = min(max(cfg[key], lo), hi)
     return cfg
+
+
+def parse_rule(line):
+    """Read a per-app rule sent by the extension; {} means use the defaults."""
+    try:
+        data = json.loads(line)
+        rule = {}
+        if 'enabled' in data:
+            rule['enabled'] = bool(data['enabled'])
+        for key, default in DEFAULTS.items():
+            if key in LIMITS and isinstance(data.get(key), (int, float)):
+                rule[key] = type(default)(data[key])
+        return clamp(rule)
+    except (ValueError, TypeError, AttributeError):
+        return {}
 
 
 class Axis:
@@ -128,17 +151,19 @@ class Mouse:
         vertical = code in (e.REL_WHEEL, e.REL_WHEEL_HI_RES)
         hires = code in (e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES)
         native = self.native_hires_v if vertical else self.native_hires_h
-        if not vertical and not self.daemon.cfg['horizontal']:
+        if not self.daemon.setting('enabled') or (
+                not vertical and not self.daemon.cfg['horizontal']):
             frame.append((e.EV_REL, code, value))
             if not native:
                 # The twin advertises hi-res axes, so libinput would ignore
                 # bare classic clicks on it: add their hi-res equivalent.
-                frame.append((e.EV_REL, e.REL_HWHEEL_HI_RES, value * NOTCH))
+                hires_code = e.REL_WHEEL_HI_RES if vertical else e.REL_HWHEEL_HI_RES
+                frame.append((e.EV_REL, hires_code, value * NOTCH))
             return
         if not hires and native:
             return  # the device reports this motion again in hi-res units
         units = value if hires else value * NOTCH
-        (self.v if vertical else self.h).add(units, self.daemon.cfg['speed'])
+        (self.v if vertical else self.h).add(units, self.daemon.setting('speed'))
         self.wake.set()
 
     async def read(self):
@@ -171,7 +196,7 @@ class Mouse:
                 await asyncio.sleep(TICK)
                 now = loop.time()
                 # Exponential ease-out: ~98 % of a glide lands within `duration`.
-                tau = self.daemon.cfg['duration'] / 1000 / 4
+                tau = self.daemon.setting('duration') / 1000 / 4
                 fraction = 1 - math.exp(-min(now - last, 0.05) / tau)
                 last = now
                 wrote = False
@@ -199,9 +224,32 @@ def is_mouse(dev):
 class Daemon:
     def __init__(self):
         self.cfg = load_config()
+        self.rule = {}        # overrides for the app under the pointer
         self.mice = {}        # path -> Mouse
         self.skipped = set()  # paths that are not mice or are unreadable
         self.stopping = asyncio.Event()
+
+    def setting(self, key):
+        if key in self.rule:
+            return self.rule[key]
+        return self.cfg.get(key, True)
+
+    async def follow_shell(self):
+        """Keep self.rule in step with the app under the pointer."""
+        while True:
+            try:
+                reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
+            except OSError:
+                await asyncio.sleep(RESCAN_INTERVAL)  # extension not running
+                continue
+            try:
+                while line := await reader.readline():
+                    self.rule = parse_rule(line)
+            except OSError:
+                pass
+            finally:
+                self.rule = {}
+                writer.close()
 
     def reload(self):
         self.cfg = load_config()
@@ -241,12 +289,14 @@ class Daemon:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.stopping.set)
         log(f'Settings: {self.cfg}')
+        shell = asyncio.ensure_future(self.follow_shell())
         while not self.stopping.is_set():
             self.scan()
             try:
                 await asyncio.wait_for(self.stopping.wait(), RESCAN_INTERVAL)
             except asyncio.TimeoutError:
                 pass
+        shell.cancel()
         for mouse in list(self.mice.values()):
             mouse.close()
 
